@@ -6,6 +6,7 @@ import logging
 import subprocess
 import sys
 import threading
+import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Optional, Any, Tuple, List
 from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
@@ -13,13 +14,15 @@ from botocore.config import Config
 import time
 from dotenv import load_dotenv
 
+# Load environment variables from .env file if it exists
 load_dotenv()
 
 # --- Configuration ---
 DEST_BUCKET_SUFFIX = "-s0"
 MAX_WORKERS = 10  # Number of buckets to process in parallel
-DB_NAME = "s3_migration_state.db"
+DB_NAME = os.environ.get("DB_NAME", "s3_migration_state.db")
 LOG_FORMAT = '%(asctime)s - %(levelname)s - %(threadName)s - %(message)s'
+DEBUG_MODE = os.environ.get('DEBUG_MODE', 'false').lower() in ('true', '1', 'yes')
 
 # Memory management configuration
 MAX_CHUNK_SIZE = 256 * 1024 * 1024  # 256MB chunks instead of 1GB
@@ -33,8 +36,12 @@ STATUS_POLICY_COPIED = 'policy_copied'
 STATUS_SYNC_STARTED = 'sync_started'
 STATUS_SYNC_COMPLETED = 'sync_completed'
 STATUS_FAILED = 'failed'
+# Set logging level based on DEBUG_MODE
+logging.basicConfig(level=logging.DEBUG if DEBUG_MODE else logging.INFO, format=LOG_FORMAT)
+logger = logging.getLogger(__name__)
 
-logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+if DEBUG_MODE:
+    logger.info("Debug mode enabled - detailed logging will be shown")
 logger = logging.getLogger(__name__)
 
 # Thread-local storage for SQLite connections
@@ -235,6 +242,9 @@ def sync_data(source_bucket: str, dest_bucket: str, source_profile: Optional[str
     Returns a tuple of (success, output_message)
     """
     output_messages = []
+    logger.info(f"[{source_bucket}] Starting sync operation to {dest_bucket}")
+    start_time = time.time()
+    last_progress_time = start_time
     try:
         # Create source and destination S3 clients based on provided credentials or profiles
         if source_credentials:
@@ -262,9 +272,14 @@ def sync_data(source_bucket: str, dest_bucket: str, source_profile: Optional[str
         transferred_objects = 0
         
         # Iterate through all objects in source bucket
+        page_count = 0
         for page in paginator.paginate(Bucket=source_bucket):
+            page_count += 1
             if 'Contents' not in page:
+                logger.debug(f"[{source_bucket}] Page {page_count} has no contents")
                 continue
+            
+            logger.debug(f"[{source_bucket}] Processing page {page_count} with {len(page['Contents'])} objects")
                 
             for obj in page['Contents']:
                 total_objects += 1
@@ -275,7 +290,7 @@ def sync_data(source_bucket: str, dest_bucket: str, source_profile: Optional[str
                     try:
                         dest_obj = s3_dest.head_object(Bucket=dest_bucket, Key=source_key)
                         if dest_obj['ETag'] == obj['ETag']:
-                            output_messages.append(f"Object {source_key} already exists with same ETag, skipping.")
+                            logger.debug(f"[{source_bucket}] Object {source_key} already exists with same ETag, skipping.")
                             continue
                     except ClientError as e:
                         if e.response['Error']['Code'] != '404':
@@ -292,7 +307,11 @@ def sync_data(source_bucket: str, dest_bucket: str, source_profile: Optional[str
                     
                     # For files requiring multipart upload
                     if obj['Size'] > 5 * 1024 * 1024 * 1024 or chunk_size < obj['Size']:  # 5GB or needs chunking
-                        output_messages.append(f"Starting multipart copy for object: {source_key} with chunk size: {chunk_size/(1024*1024):.2f}MB")
+                        size_str = f"{obj['Size']/(1024*1024):.2f}MB" if obj['Size'] < 1024*1024*1024 else f"{obj['Size']/(1024*1024*1024):.2f}GB"
+                        msg = f"Starting multipart copy for object: {source_key} ({size_str}) with chunk size: {chunk_size/(1024*1024):.2f}MB"
+                        # Use INFO level for large file transfers so they're visible without debug mode
+                        logger.info(f"[{source_bucket}] {msg}")
+                        output_messages.append(msg)
                         # Get source object metadata
                         response = s3_source.head_object(Bucket=source_bucket, Key=source_key)
                         content_type = response.get('ContentType', 'application/octet-stream')
@@ -303,15 +322,19 @@ def sync_data(source_bucket: str, dest_bucket: str, source_profile: Optional[str
                             Key=source_key,
                             ContentType=content_type
                         )
-                        
                         # Copy parts
                         parts = []
                         total_parts = (obj['Size'] + chunk_size - 1) // chunk_size
                         
+                        multipart_start_time = time.time()
                         for i in range(total_parts):
                             start = i * chunk_size
                             end = min(start + chunk_size - 1, obj['Size'] - 1)
                             
+                            part_size_mb = (end - start + 1) / (1024 * 1024)
+                            logger.debug(f"[{source_bucket}] Uploading part {i+1}/{total_parts} for {source_key} (part size: {part_size_mb:.2f}MB)")
+                            
+                            part_start_time = time.time()
                             response = s3_dest.upload_part_copy(
                                 Bucket=dest_bucket,
                                 Key=source_key,
@@ -320,6 +343,8 @@ def sync_data(source_bucket: str, dest_bucket: str, source_profile: Optional[str
                                 CopySource=copy_source,
                                 CopySourceRange=f'bytes={start}-{end}'
                             )
+                            part_duration = time.time() - part_start_time
+                            logger.debug(f"[{source_bucket}] Completed part {i+1}/{total_parts} for {source_key} in {part_duration:.2f} seconds")
                             
                             parts.append({
                                 'PartNumber': i + 1,
@@ -336,29 +361,58 @@ def sync_data(source_bucket: str, dest_bucket: str, source_profile: Optional[str
                             UploadId=mpu['UploadId'],
                             MultipartUpload={'Parts': parts}
                         )
+                        
+                        multipart_duration = time.time() - multipart_start_time
+                        size_str = f"{obj['Size']/(1024*1024):.2f}MB" if obj['Size'] < 1024*1024*1024 else f"{obj['Size']/(1024*1024*1024):.2f}GB"
+                        # Use INFO level for completion of large file transfers
+                        logger.info(f"[{source_bucket}] Completed multipart upload for {source_key} ({size_str}) in {multipart_duration:.2f} seconds")
                     else:
+                        size_str = f"{obj['Size']/1024:.2f}KB" if obj['Size'] < 1024*1024 else f"{obj['Size']/(1024*1024):.2f}MB"
+                        logger.debug(f"[{source_bucket}] Copying object {source_key} (size: {size_str})")
+                        start_time = time.time()
                         s3_dest.copy(copy_source, dest_bucket, source_key)
+                        duration = time.time() - start_time
+                        logger.debug(f"[{source_bucket}] Copied {source_key} in {duration:.2f} seconds")
                     
                     transferred_objects += 1
-                    if transferred_objects % 100 == 0:
-                        output_messages.append(f"Transferred {transferred_objects}/{total_objects} objects...")
+                    # Log progress more frequently in debug mode
+                    log_frequency = 10 if DEBUG_MODE else 100
+                    if transferred_objects % log_frequency == 0:
+                        msg = f"Transferred {transferred_objects}/{total_objects} objects..."
+                        # Use INFO level for regular progress updates so they're visible without debug mode
+                        logger.info(f"[{source_bucket}] {msg}")
+                        output_messages.append(msg)
+                        
+                        # Provide a periodic summary at INFO level regardless of log_frequency
+                        current_time = time.time()
+                        # Log a summary every 60 seconds
+                        if current_time - last_progress_time > 60:
+                            elapsed = current_time - start_time
+                            objects_per_second = transferred_objects / elapsed if elapsed > 0 else 0
+                            percent_complete = (transferred_objects / total_objects * 100) if total_objects > 0 else 0
+                            logger.info(f"[{source_bucket}] Progress summary: {transferred_objects}/{total_objects} objects ({percent_complete:.1f}%) transferred in {elapsed:.1f} seconds ({objects_per_second:.2f} objects/sec)")
+                            last_progress_time = current_time
                         
                 except Exception as e:
-                    output_messages.append(f"Error copying object {source_key}: {str(e)}")
+                    error_msg = f"Error copying object {source_key}: {str(e)}"
+                    logger.error(f"[{source_bucket}] {error_msg}")
+                    output_messages.append(error_msg)
                     continue
                 
                 # Force garbage collection after large transfers
                 if obj['Size'] > MAX_MEMORY_PER_WORKER:
                     import gc
                     gc.collect()
-        
         success = True
         final_message = f"Completed transfer of {transferred_objects}/{total_objects} objects."
+        logger.info(f"[{source_bucket}] {final_message}")
         output_messages.append(final_message)
+        
         
     except Exception as e:
         success = False
         error_message = f"Error during sync operation: {str(e)}"
+        logger.error(f"[{source_bucket}] {error_message}")
         output_messages.append(error_message)
     
     return success, "\n".join(output_messages)
@@ -498,7 +552,7 @@ def process_bucket(
              )
 
              if success:
-                 logger.info(f"[{source_bucket_name}] Sync completed.")
+                 logger.info(f"[{source_bucket_name}] Sync completed successfully. {sync_output.splitlines()[-1] if sync_output else ''}")
                  current_status = STATUS_SYNC_COMPLETED
                  update_bucket_status(source_bucket_name, current_status, sync_output=sync_output)
              else:
@@ -552,21 +606,26 @@ def get_valid_bucket_name(source_bucket: str, suffix: str) -> str:
     - Begin and end with a letter or number
     - Be between 3 and 63 characters long
     """
-    # Ensure we're using a valid suffix format (replace _ with - if needed)
-    clean_suffix = suffix.replace('_', '-')
+    import re
+    
+    # Ensure source bucket is lowercase
+    source_bucket = source_bucket.lower()
+    
+    # Ensure suffix starts with a valid separator
+    if suffix and not suffix.startswith('-') and not suffix.startswith('_'):
+        suffix = '-' + suffix
     
     # Create the destination bucket name
-    dest_name = source_bucket + clean_suffix
+    dest_name = source_bucket + suffix
     
     # S3 bucket names are limited to 63 characters
     if len(dest_name) > 63:
         # If too long, truncate the source name to fit the suffix
-        max_source_len = 63 - len(clean_suffix)
-        dest_name = source_bucket[:max_source_len] + clean_suffix
+        max_source_len = 63 - len(suffix)
+        dest_name = source_bucket[:max_source_len] + suffix
     
     # S3 bucket names can only contain lowercase letters, numbers, dots, and hyphens
     # and must begin and end with a letter or number
-    import re
     if not re.match(r'^[a-z0-9][a-z0-9.-]*[a-z0-9]$', dest_name):
         # Clean up the name to make it valid
         # Replace invalid characters with hyphens
@@ -577,22 +636,147 @@ def get_valid_bucket_name(source_bucket: str, suffix: str) -> str:
         if not dest_name[-1].isalnum():
             dest_name = dest_name[:-1] + 's'
     
+    # Log the transformation for debugging
+    if dest_name != source_bucket + suffix:
+        logger.info(f"Transformed bucket name: {source_bucket + suffix} -> {dest_name}")
+    
     return dest_name
 
-def main():
-    logger.info("--- Starting S3 Bucket Migration Script ---")
+def check_bucket_status(bucket_name: str):
+    """Display detailed status information for a specific bucket."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT source_bucket_name, dest_bucket_name, status, region, error_message, last_sync_output FROM buckets WHERE source_bucket_name = ?",
+            (bucket_name,)
+        )
+        bucket_info = cursor.fetchone()
+        
+        if not bucket_info:
+            logger.info(f"Bucket '{bucket_name}' not found in the database.")
+            return
+            
+        source, dest, status, region, error, sync_output = bucket_info
+        
+        logger.info(f"===== BUCKET STATUS: {source} =====")
+        logger.info(f"Destination bucket: {dest}")
+        logger.info(f"Current status: {status}")
+        if region:
+            logger.info(f"Region: {region}")
+        
+        if status == STATUS_FAILED:
+            logger.info("--- ERROR DETAILS ---")
+            if error:
+                logger.info(f"Error message: {error}")
+            if sync_output:
+                logger.info("--- SYNC OUTPUT ---")
+                logger.info(sync_output)
+        elif sync_output:
+            logger.info("--- SYNC OUTPUT ---")
+            logger.info(sync_output)
+            
+        logger.info("=" * 50)
+            
+    except sqlite3.Error as e:
+        logger.error(f"DB Error fetching bucket details: {e}")
 
-    # Get credentials and account IDs from environment variables
-    old_key = os.environ.get('OLD_AWS_ACCESS_KEY_ID')
-    old_secret = os.environ.get('OLD_AWS_SECRET_ACCESS_KEY')
-    new_key = os.environ.get('NEW_AWS_ACCESS_KEY_ID')
-    new_secret = os.environ.get('NEW_AWS_SECRET_ACCESS_KEY')
-    old_account_id = os.environ.get('OLD_AWS_ACCOUNT_ID')
-    new_account_id = os.environ.get('NEW_AWS_ACCOUNT_ID')
-    source_profile = os.environ.get('AWS_PROFILE_SOURCE')
-    dest_profile = os.environ.get('AWS_PROFILE_DEST')
-    source_region = os.environ.get('SOURCE_BUCKET_REGION')
-    dest_region = os.environ.get('DEST_BUCKET_REGION')
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description='AWS S3 Bucket Migration Tool',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    
+    # Create subparsers for different commands
+    subparsers = parser.add_subparsers(dest='command', help='Command to execute')
+    
+    # Migrate command - main functionality
+    migrate_parser = subparsers.add_parser('migrate', help='Migrate S3 buckets from source to destination account')
+    
+    # Required arguments group
+    required_group = migrate_parser.add_argument_group('required arguments')
+    required_group.add_argument('--old-key', dest='old_key', help='AWS Access Key ID for source account', required=True)
+    required_group.add_argument('--old-secret', dest='old_secret', help='AWS Secret Access Key for source account', required=True)
+    required_group.add_argument('--new-key', dest='new_key', help='AWS Access Key ID for destination account', required=True)
+    required_group.add_argument('--new-secret', dest='new_secret', help='AWS Secret Access Key for destination account', required=True)
+    
+    # Optional arguments
+    migrate_parser.add_argument('--old-account-id', dest='old_account_id', help='AWS Account ID for source account (for policy migration)')
+    migrate_parser.add_argument('--new-account-id', dest='new_account_id', help='AWS Account ID for destination account (for policy migration)')
+    migrate_parser.add_argument('--source-profile', dest='source_profile', help='AWS CLI profile for source account')
+    migrate_parser.add_argument('--dest-profile', dest='dest_profile', help='AWS CLI profile for destination account')
+    migrate_parser.add_argument('--source-region', dest='source_region', help='AWS region for source buckets')
+    migrate_parser.add_argument('--dest-region', dest='dest_region', help='AWS region for destination buckets')
+    migrate_parser.add_argument('--bucket-suffix', dest='bucket_suffix', default=DEST_BUCKET_SUFFIX,
+                               help='Suffix to append to destination bucket names')
+    migrate_parser.add_argument('--max-workers', dest='max_workers', type=int, default=MAX_WORKERS,
+                               help='Maximum number of buckets to process in parallel')
+    migrate_parser.add_argument('--blacklist', dest='blacklist',
+                               help='Comma-separated list of bucket name prefixes to exclude')
+    migrate_parser.add_argument('--debug', action='store_true', help='Enable debug logging')
+    
+    # Check bucket status command
+    check_parser = subparsers.add_parser('check', help='Check status of a specific bucket')
+    check_parser.add_argument('bucket_name', help='Name of the bucket to check')
+    
+    # Clean command to remove the database
+    clean_parser = subparsers.add_parser('clean', help='Clean up the database files')
+    
+    return parser.parse_args()
+
+def main():
+    """Main entry point for the script."""
+    args = parse_args()
+    
+    # Set debug mode based on command line argument
+    global DEBUG_MODE
+    if hasattr(args, 'debug') and args.debug:
+        DEBUG_MODE = True
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.info("Debug mode enabled - detailed logging will be shown")
+    
+    # Initialize DB Connection
+    init_db(DB_NAME)
+    
+    # Handle different commands
+    if args.command == 'check':
+        logger.info(f"Checking status for bucket: {args.bucket_name}")
+        check_bucket_status(args.bucket_name)
+        sys.exit(0)
+    elif args.command == 'clean':
+        logger.info("Cleaning up database files...")
+        cleanup_db()
+        sys.exit(0)
+    elif args.command == 'migrate':
+        # Update global constants if provided in arguments
+        global DEST_BUCKET_SUFFIX, MAX_WORKERS
+        if args.bucket_suffix:
+            DEST_BUCKET_SUFFIX = args.bucket_suffix
+        if args.max_workers:
+            MAX_WORKERS = args.max_workers
+            
+        logger.info("--- Starting S3 Bucket Migration Script ---")
+        
+        # Get credentials and account IDs from command line arguments
+        old_key = args.old_key
+        old_secret = args.old_secret
+        new_key = args.new_key
+        new_secret = args.new_secret
+        old_account_id = args.old_account_id
+        new_account_id = args.new_account_id
+        source_profile = args.source_profile
+        dest_profile = args.dest_profile
+        source_region = args.source_region
+        dest_region = args.dest_region
+        
+        # Set blacklist from command line argument
+        if args.blacklist:
+            os.environ['BLACKLIST_BUCKET_STARTSWITH'] = args.blacklist
+    else:
+        # No command specified, show help
+        parse_args.__globals__['parser'].print_help()
+        sys.exit(1)
 
     # Check required credentials
     if not all([old_key, old_secret, new_key, new_secret]):
@@ -658,7 +842,37 @@ def main():
         add_bucket_to_db(bucket_name, dest_bucket_name)
 
     # Get list of buckets to process (not completed)
-    buckets_to_process = get_buckets_to_process()
+    all_buckets_to_process = get_buckets_to_process()
+    
+    # Apply blacklist filter to buckets from database as well
+    blacklist_bucket_startswith = [pattern.strip() for pattern in os.environ.get('BLACKLIST_BUCKET_STARTSWITH', '').split(',') if pattern.strip()]
+    buckets_to_process = [
+        (source, dest, region, status) for source, dest, region, status in all_buckets_to_process
+        if not any(source.startswith(pattern) for pattern in blacklist_bucket_startswith)
+    ]
+    
+    # Fix any incorrect destination bucket names in the database
+    conn = get_db_connection()
+    try:
+        for source, dest, region, status in buckets_to_process:
+            # Check if destination bucket name has incorrect suffix
+            correct_dest = get_valid_bucket_name(source, DEST_BUCKET_SUFFIX)
+            if dest != correct_dest:
+                logger.info(f"Fixing incorrect destination bucket name: {dest} -> {correct_dest}")
+                conn.execute(
+                    "UPDATE buckets SET dest_bucket_name = ? WHERE source_bucket_name = ?",
+                    (correct_dest, source)
+                )
+        conn.commit()
+        
+        # Refresh the list with corrected names
+        buckets_to_process = [
+            (source, get_valid_bucket_name(source, DEST_BUCKET_SUFFIX), region, status)
+            for source, dest, region, status in buckets_to_process
+        ]
+    except sqlite3.Error as e:
+        logger.error(f"DB Error fixing destination bucket names: {e}")
+    
     if not buckets_to_process:
         logger.info("No buckets found requiring processing according to the database.")
         sys.exit(0)
@@ -714,6 +928,39 @@ def main():
     else:
         logger.info("Some tasks failed or were incomplete. Keeping database for retry.")
         logger.info("Check logs and 's3_migration_state.db' for details on failures.")
+        # Display error messages for failed buckets
+        display_failed_bucket_errors()
+        
+        # Provide instructions for checking specific bucket status
+        logger.info("To check a specific bucket's status, run: python aws_copier.py --check-bucket BUCKET_NAME")
+
+def display_failed_bucket_errors():
+    """Display detailed error messages for failed buckets from the database."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT source_bucket_name, dest_bucket_name, error_message, last_sync_output FROM buckets WHERE status = ?",
+            (STATUS_FAILED,)
+        )
+        failed_buckets = cursor.fetchall()
+        
+        if not failed_buckets:
+            logger.info("No failed buckets found in the database.")
+            return
+            
+        logger.info(f"Found {len(failed_buckets)} failed buckets. Displaying error details:")
+        
+        for source, dest, error, sync_output in failed_buckets:
+            logger.info(f"===== FAILED BUCKET: {source} (Dest: {dest}) =====")
+            if error:
+                logger.info(f"Error message: {error}")
+            if sync_output:
+                logger.info(f"Sync output: {sync_output}")
+            logger.info("=" * 50)
+            
+    except sqlite3.Error as e:
+        logger.error(f"DB Error fetching failed bucket details: {e}")
 
 if __name__ == "__main__":
     main()

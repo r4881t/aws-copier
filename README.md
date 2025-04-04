@@ -15,43 +15,103 @@ A tool to copy S3 buckets from one AWS account to another, with optional bucket 
 ## Prerequisites
 
 - Python 3.7+
-- AWS CLI installed and configured
+- AWS CLI installed and configured (for local usage)
 - Appropriate AWS permissions in both source and destination accounts
 - Required Python packages (install using `poetry install`)
 
-## Setup
+## Installation
+
+### Using Poetry (Local Installation)
 
 1. Clone this repository
 2. Install dependencies:
    ```bash
    poetry install
    ```
-3. Copy `.env.example` to `.env`:
+
+### Using Docker
+
+You can also use the provided Docker image:
+
+```bash
+# Build the Docker image
+docker build -t aws-copier .
+
+# Run the Docker container
+docker run -v $(pwd)/data:/data aws-copier migrate --help
+```
+
+## Usage
+
+### Command Line Interface
+
+The tool now supports a command-line interface with the following commands:
+
+#### Migrate Buckets
+
+```bash
+# Using Poetry
+poetry run python -m src.aws_copier migrate \
+  --old-key YOUR_SOURCE_ACCESS_KEY \
+  --old-secret YOUR_SOURCE_SECRET_KEY \
+  --new-key YOUR_DEST_ACCESS_KEY \
+  --new-secret YOUR_DEST_SECRET_KEY \
+  [--old-account-id SOURCE_ACCOUNT_ID] \
+  [--new-account-id DEST_ACCOUNT_ID] \
+  [--source-profile SOURCE_PROFILE] \
+  [--dest-profile DEST_PROFILE] \
+  [--source-region SOURCE_REGION] \
+  [--dest-region DEST_REGION] \
+  [--bucket-suffix SUFFIX] \
+  [--max-workers NUM_WORKERS] \
+  [--blacklist PREFIX1,PREFIX2] \
+  [--debug]
+
+# Using Docker
+docker run -v $(pwd)/data:/data aws-copier migrate \
+  --old-key YOUR_SOURCE_ACCESS_KEY \
+  --old-secret YOUR_SOURCE_SECRET_KEY \
+  --new-key YOUR_DEST_ACCESS_KEY \
+  --new-secret YOUR_DEST_SECRET_KEY \
+  [--old-account-id SOURCE_ACCOUNT_ID] \
+  [--new-account-id DEST_ACCOUNT_ID] \
+  [--source-region SOURCE_REGION] \
+  [--dest-region DEST_REGION] \
+  [--bucket-suffix SUFFIX] \
+  [--max-workers NUM_WORKERS] \
+  [--blacklist PREFIX1,PREFIX2] \
+  [--debug]
+```
+
+#### Check Bucket Status
+
+```bash
+# Using Poetry
+poetry run python -m src.aws_copier check BUCKET_NAME
+
+# Using Docker
+docker run -v $(pwd)/data:/data aws-copier check BUCKET_NAME
+```
+
+#### Clean Database
+
+```bash
+# Using Poetry
+poetry run python -m src.aws_copier clean
+
+# Using Docker
+docker run -v $(pwd)/data:/data aws-copier clean
+```
+
+### Environment Variables (Legacy Support)
+
+The tool still supports configuration via environment variables through a `.env` file:
+
+1. Copy `.env.example` to `.env`:
    ```bash
    cp .env.example .env
    ```
-4. Configure the environment variables in `.env` file:
-   - Required variables:
-     - OLD_AWS_ACCESS_KEY_ID and OLD_AWS_SECRET_ACCESS_KEY for source account
-     - NEW_AWS_ACCESS_KEY_ID and NEW_AWS_SECRET_ACCESS_KEY for destination account
-   - Optional variables:
-     - SOURCE_BUCKET_REGION to specify the source bucket region
-     - DEST_BUCKET_REGION to specify the destination bucket region
-     - OLD_AWS_ACCOUNT_ID and NEW_AWS_ACCOUNT_ID (only needed if you want to copy bucket policies)
-     - AWS_PROFILE_SOURCE and AWS_PROFILE_DEST for using AWS CLI profiles
-
-## Region Configuration
-
-By default, the script will:
-1. Create destination buckets in the same region as their source buckets
-2. You can override this behavior by setting:
-   - SOURCE_BUCKET_REGION: Forces all source bucket operations to use this region
-   - DEST_BUCKET_REGION: Creates all destination buckets in this region
-
-This is useful when you want to:
-- Consolidate buckets in a specific region
-- Meet data residency requirements
-- Optimize for cost or latency by choosing specific regions
+2. Configure the environment variables in `.env` file
 
 ## Required AWS Permissions
 
@@ -67,24 +127,22 @@ This is useful when you want to:
 - s3:PutBucketPolicy (only if copying policies)
 - s3:PutObject
 
-## Usage
+## Region Configuration
 
-Run the script:
-```bash
-poetry run python src/aws_copier.py
-```
+By default, the script will:
+1. Create destination buckets in the same region as their source buckets
+2. You can override this behavior by setting:
+   - `--source-region`: Forces all source bucket operations to use this region
+   - `--dest-region`: Creates all destination buckets in this region
 
-The script will:
-1. Discover all buckets in the source account
-2. Create corresponding buckets in the destination account (with "_s" suffix)
-3. Copy and adapt bucket policies (if AWS account IDs are provided)
-4. Sync bucket contents using AWS CLI
-
-Progress is tracked in `s3_migration_state.db` and the script can be safely interrupted and resumed.
+This is useful when you want to:
+- Consolidate buckets in a specific region
+- Meet data residency requirements
+- Optimize for cost or latency by choosing specific regions
 
 ## Bucket Policy Migration
 
-Bucket policies are only copied and adapted if both OLD_AWS_ACCOUNT_ID and NEW_AWS_ACCOUNT_ID environment variables are provided. If either is missing, the policy copy step is skipped and only the bucket contents are synchronized. This is useful when:
+Bucket policies are only copied and adapted if both `--old-account-id` and `--new-account-id` parameters are provided. If either is missing, the policy copy step is skipped and only the bucket contents are synchronized. This is useful when:
 - You don't need to preserve bucket policies
 - You want to set up new policies manually
 - The source buckets don't have any policies
@@ -99,9 +157,11 @@ The script maintains state in an SQLite database (`s3_migration_state.db`). Each
 - sync_completed: All data has been copied
 - failed: An error occurred (check logs for details)
 
+When using Docker, the database is stored in the `/data` volume, which can be mapped to a local directory for persistence.
+
 ## Troubleshooting
 
 - Check logs for detailed error messages
 - Verify AWS credentials and permissions
 - Ensure AWS CLI is properly configured if using profiles
-- Review `s3_migration_state.db` for bucket states
+- Review the database for bucket states using the `check` command
